@@ -121,14 +121,16 @@ struct ContentView: View {
     @State private var isHoveringHistoryPath = false
     @State private var isHoveringHistoryArrow = false
     @State private var isHoveringCopyTranscript = false
-    @State private var colorScheme: ColorScheme = .light // Add state for color scheme
+    @AppStorage("colorScheme") private var colorSchemeString: String = "auto"
+    @Environment(\.colorScheme) private var systemColorScheme
+    @EnvironmentObject private var appearanceManager: AppearanceManager
     @State private var themeOverlayOpacity: Double = 0
     @State private var themeOverlayColor: Color = .white
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
     @State private var didCopyPrompt: Bool = false // Add state for copy prompt feedback
     @State private var didCopyTranscript: Bool = false
     @State private var selectedVideoHasTranscript = false
-    @State private var backspaceDisabled = false // Add state for backspace toggle
+    @State private var backspaceDisabled: Bool = false // Add state for backspace toggle (default set in init)
     @State private var isHoveringBackspaceToggle = false // Add state for backspace toggle hover
     @State private var showingVideoRecording = false // Add state for video recording view
     @State private var isHoveringVideoButton = false // Add state for video button hover
@@ -139,6 +141,13 @@ struct ContentView: View {
     @State private var showingVideoPermissionPopover = false
     @State private var videoPermissionPopoverItems: [VideoPermissionPopoverItem] = []
     @State private var videoPermissionPopoverFallbackMessage: String? = nil
+    @AppStorage("customDirectoryPath") private var customDirectoryPath: String?
+    @State private var pinnedEntryIds: Set<String> = []
+    @State private var hoveredPinId: UUID? = nil
+    @State private var searchText: String = ""
+    @State private var showingTimeline: Bool = false
+    @State private var isHoveringTimeline: Bool = false
+    @State private var showingThemePopover: Bool = false
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -160,11 +169,14 @@ struct ContentView: View {
     private let fileManager = FileManager.default
     private let saveTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     
-    // Add cached documents directory
-    private let documentsDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Freewrite")
-        
-        // Create Freewrite directory if it doesn't exist
+    // Computed documents directory — supports custom folder (Feature 4)
+    private var documentsDirectory: URL {
+        if let customPath = customDirectoryPath,
+           FileManager.default.fileExists(atPath: customPath) {
+            return URL(fileURLWithPath: customPath)
+        }
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Freewrite")
         if !FileManager.default.fileExists(atPath: directory.path) {
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -173,26 +185,8 @@ struct ContentView: View {
                 print("Error creating directory: \(error)")
             }
         }
-        
         return directory
-    }()
-
-    private let videosDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Freewrite")
-            .appendingPathComponent("Videos")
-
-        if !FileManager.default.fileExists(atPath: directory.path) {
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                print("Successfully created Freewrite/Videos directory")
-            } catch {
-                print("Error creating videos directory: \(error)")
-            }
-        }
-
-        return directory
-    }()
+    }
 
     private let thumbnailMemoryCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
@@ -227,11 +221,14 @@ struct ContentView: View {
     Here's my journal entry:
     """
     
-    // Initialize with saved theme preference if available
+    // Initialize — backspace defaults to ON (disabled) unless user has previously changed it
     init() {
-        // Load saved color scheme preference
-        let savedScheme = UserDefaults.standard.string(forKey: "colorScheme") ?? "light"
-        _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
+        if UserDefaults.standard.object(forKey: "backspaceDisabled") != nil {
+            _backspaceDisabled = State(initialValue: UserDefaults.standard.bool(forKey: "backspaceDisabled"))
+        } else {
+            _backspaceDisabled = State(initialValue: true)
+            UserDefaults.standard.set(true, forKey: "backspaceDisabled")
+        }
     }
     
     // Modify getDocumentsDirectory to use cached value
@@ -240,7 +237,16 @@ struct ContentView: View {
     }
 
     private func getVideosDirectory() -> URL {
-        return videosDirectory
+        let directory = documentsDirectory.appendingPathComponent("Videos")
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                print("Successfully created Freewrite/Videos directory")
+            } catch {
+                print("Error creating videos directory: \(error)")
+            }
+        }
+        return directory
     }
 
     private func getVideoEntryDirectory(for videoFilename: String) -> URL {
@@ -677,6 +683,80 @@ struct ContentView: View {
         }
     }
     
+    // MARK: - Auto dark mode (Feature 1)
+
+    private var currentColorScheme: ColorScheme {
+        switch colorSchemeString {
+        case "light": return .light
+        case "dark": return .dark
+        default: return appearanceManager.colorScheme
+        }
+    }
+
+    // MARK: - Pin entries (Feature 3)
+
+    private var sortedEntries: [HumanEntry] {
+        let pinned = entries.filter { pinnedEntryIds.contains($0.id.uuidString) }
+        let unpinned = entries.filter { !pinnedEntryIds.contains($0.id.uuidString) }
+        return pinned + unpinned
+    }
+
+    private func isEntryPinned(_ entry: HumanEntry) -> Bool {
+        pinnedEntryIds.contains(entry.id.uuidString)
+    }
+
+    private func togglePin(_ entry: HumanEntry) {
+        if pinnedEntryIds.contains(entry.id.uuidString) {
+            pinnedEntryIds.remove(entry.id.uuidString)
+        } else {
+            pinnedEntryIds.insert(entry.id.uuidString)
+        }
+        UserDefaults.standard.set(Array(pinnedEntryIds), forKey: "pinnedEntryIds")
+    }
+
+    private func loadPinnedEntries() {
+        if let saved = UserDefaults.standard.array(forKey: "pinnedEntryIds") as? [String] {
+            pinnedEntryIds = Set(saved)
+        }
+    }
+
+    // MARK: - Search (Feature 5)
+
+    private var filteredEntries: [HumanEntry] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return sortedEntries }
+        return sortedEntries.filter { entry in
+            if entry.previewText.lowercased().contains(query) { return true }
+            if entry.date.lowercased().contains(query) { return true }
+            let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
+            if let content = try? String(contentsOf: fileURL, encoding: .utf8),
+               content.lowercased().contains(query) { return true }
+            if let videoFilename = resolvedVideoFilename(for: entry),
+               let transcript = loadTranscriptText(for: videoFilename),
+               transcript.lowercased().contains(query) { return true }
+            return false
+        }
+    }
+
+    // MARK: - Custom folder (Feature 4)
+
+    private func selectCustomDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "Select a folder for your entries"
+        if panel.runModal() == .OK, let url = panel.url {
+            customDirectoryPath = url.path
+            loadExistingEntries()
+        }
+    }
+
+    private func resetToDefaultDirectory() {
+        customDirectoryPath = nil
+        loadExistingEntries()
+    }
+
     var randomButtonTitle: String {
         return currentRandomFont.isEmpty ? "Random" : "Random [\(currentRandomFont)]"
     }
@@ -838,9 +918,9 @@ struct ContentView: View {
     
     var timerColor: Color {
         if timerIsRunning {
-            return isHoveringTimer ? (colorScheme == .light ? .black : .white) : .gray.opacity(0.8)
+            return isHoveringTimer ? (currentColorScheme == .light ? .black : .white) : .gray.opacity(0.8)
         } else {
-            return isHoveringTimer ? (colorScheme == .light ? .black : .white) : (colorScheme == .light ? .gray : .gray.opacity(0.8))
+            return isHoveringTimer ? (currentColorScheme == .light ? .black : .white) : (currentColorScheme == .light ? .gray : .gray.opacity(0.8))
         }
     }
     
@@ -856,25 +936,25 @@ struct ContentView: View {
     
     // Add a color utility computed property
     var popoverBackgroundColor: Color {
-        return colorScheme == .light ? Color(NSColor.controlBackgroundColor) : Color(NSColor.darkGray)
+        return currentColorScheme == .light ? Color(NSColor.controlBackgroundColor) : Color(NSColor.darkGray)
     }
-    
+
     var popoverTextColor: Color {
-        return colorScheme == .light ? Color.primary : Color.white
+        return currentColorScheme == .light ? Color.primary : Color.white
     }
 
     
     var body: some View {
-        let buttonBackground = colorScheme == .light ? Color.white : Color.black
+        let buttonBackground = currentColorScheme == .light ? Color.white : Color.black
         let navHeight: CGFloat = 68
-        let textColor = colorScheme == .light ? Color.gray : Color.gray.opacity(0.8)
-        let textHoverColor = colorScheme == .light ? Color.black : Color.white
+        let textColor = currentColorScheme == .light ? Color.gray : Color.gray.opacity(0.8)
+        let textHoverColor = currentColorScheme == .light ? Color.black : Color.white
         let isViewingVideoEntry = currentVideoURL != nil
         
         HStack(spacing: 0) {
             // Main content
             ZStack {
-                Color(colorScheme == .light ? .white : .black)
+                Color(currentColorScheme == .light ? .white : .black)
                     .ignoresSafeArea()
 
                 // Theme transition overlay — fades out after instant theme switch
@@ -898,9 +978,9 @@ struct ContentView: View {
                 } else {
                     // Show text editor for text entries
                     TextEditor(text: $text)
-                    .background(Color(colorScheme == .light ? .white : .black))
+                    .background(Color(currentColorScheme == .light ? .white : .black))
                     .font(.custom(selectedFont, size: fontSize))
-                    .foregroundColor(colorScheme == .light ? Color(red: 0.20, green: 0.20, blue: 0.20) : Color(red: 0.9, green: 0.9, blue: 0.9))
+                    .foregroundColor(currentColorScheme == .light ? Color(red: 0.20, green: 0.20, blue: 0.20) : Color(red: 0.9, green: 0.9, blue: 0.9))
                     .scrollContentBackground(.hidden)
                     .scrollIndicators(.never)
                     .lineSpacing(lineHeight)
@@ -908,7 +988,7 @@ struct ContentView: View {
                     .padding(.top, 40)
                     .id("\(selectedFont)-\(fontSize)")
                     .padding(.bottom, bottomNavOpacity > 0 ? navHeight : 0)
-                    .colorScheme(colorScheme)
+                    .colorScheme(currentColorScheme)
                     .onAppear {
                         placeholderText = placeholderOptions.randomElement() ?? "Begin writing"
                         // Removed findSubview code which was causing errors
@@ -928,7 +1008,7 @@ struct ContentView: View {
                             if text.isEmpty {
                                 Text(placeholderText)
                                     .font(.custom(selectedFont, size: fontSize))
-                                    .foregroundColor(colorScheme == .light ? .gray.opacity(0.5) : .gray.opacity(0.6))
+                                    .foregroundColor(currentColorScheme == .light ? .gray.opacity(0.5) : .gray.opacity(0.6))
                                     .allowsHitTesting(false)
                                     .offset(x: 5, y: 40)
                             }
@@ -1221,7 +1301,7 @@ struct ContentView: View {
                                     }
                                 }
                                 .frame(minWidth: 300, idealWidth: 320, maxWidth: 360)
-                                .background(colorScheme == .light ? Color.white : Color.black)
+                                .background(currentColorScheme == .light ? Color.white : Color.black)
                             }
 
                             Text("•")
@@ -1388,6 +1468,7 @@ struct ContentView: View {
                                 // Backspace toggle button
                                 Button(action: {
                                     backspaceDisabled.toggle()
+                                    UserDefaults.standard.set(backspaceDisabled, forKey: "backspaceDisabled")
                                 }) {
                                     Text(backspaceDisabled ? "Backspace is Off" : "Backspace is On")
                                         .foregroundColor(isHoveringBackspaceToggle ? textHoverColor : textColor)
@@ -1448,17 +1529,11 @@ struct ContentView: View {
                             Text("•")
                                 .foregroundColor(.gray)
                             
-                            // Theme toggle button
+                            // Theme toggle button (Light / Dark / Auto)
                             Button(action: {
-                                themeOverlayColor = colorScheme == .light ? .white : .black
-                                themeOverlayOpacity = 1
-                                colorScheme = colorScheme == .light ? .dark : .light
-                                UserDefaults.standard.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
-                                withAnimation(.easeInOut(duration: 0.35)) {
-                                    themeOverlayOpacity = 0
-                                }
+                                showingThemePopover = true
                             }) {
-                                Image(systemName: colorScheme == .light ? "moon.fill" : "sun.max.fill")
+                                Image(systemName: colorSchemeString == "dark" ? "moon.fill" : colorSchemeString == "light" ? "sun.max.fill" : "sun.dust.fill")
                                     .foregroundColor(isHoveringThemeToggle ? textHoverColor : textColor)
                             }
                             .buttonStyle(.plain)
@@ -1470,6 +1545,38 @@ struct ContentView: View {
                                 } else {
                                     NSCursor.pop()
                                 }
+                            }
+                            .popover(isPresented: $showingThemePopover, attachmentAnchor: .point(UnitPoint(x: 0.5, y: 0)), arrowEdge: .top) {
+                                VStack(spacing: 0) {
+                                    ForEach([("Light", "sun.max.fill", "light"), ("Dark", "moon.fill", "dark"), ("Auto", "sun.dust.fill", "auto")], id: \.0) { name, icon, key in
+                                        Button(action: {
+                                            colorSchemeString = key
+                                            showingThemePopover = false
+                                        }) {
+                                            HStack(spacing: 8) {
+                                                Image(systemName: icon)
+                                                    .frame(width: 16)
+                                                Text(name)
+                                                Spacer()
+                                                if colorSchemeString == key {
+                                                    Image(systemName: "checkmark")
+                                                        .font(.system(size: 11))
+                                                }
+                                            }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 8)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .foregroundColor(popoverTextColor)
+                                        .onHover { hovering in
+                                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                        }
+                                        if key != "auto" { Divider() }
+                                    }
+                                }
+                                .frame(minWidth: 150)
+                                .background(popoverBackgroundColor)
                             }
 
                             Text("•")
@@ -1494,6 +1601,26 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
+
+                            Text("•")
+                                .foregroundColor(.gray)
+
+                            // Timeline button
+                            Button("Timeline") {
+                                showingTimeline = true
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(isHoveringTimeline ? textHoverColor : textColor)
+                            .font(.system(size: 13))
+                            .onHover { hovering in
+                                isHoveringTimeline = hovering
+                                isHoveringBottomNav = hovering
+                                if hovering {
+                                    NSCursor.pointingHand.push()
+                                } else {
+                                    NSCursor.pop()
+                                }
+                            }
                         }
                         .padding(8)
                         .cornerRadius(6)
@@ -1502,7 +1629,7 @@ struct ContentView: View {
                         }
                     }
                     .padding()
-                    .background(Color(colorScheme == .light ? .white : .black))
+                    .background(Color(currentColorScheme == .light ? .white : .black))
                     .opacity(bottomNavOpacity)
                     .onHover { hovering in
                         isHoveringBottomNav = hovering
@@ -1524,11 +1651,11 @@ struct ContentView: View {
                 Divider()
                 
                 VStack(spacing: 0) {
-                    // Header
-                    Button(action: {
-                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: getDocumentsDirectory().path)
-                    }) {
-                        HStack {
+                    // Header with folder controls
+                    HStack(spacing: 0) {
+                        Button(action: {
+                            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: getDocumentsDirectory().path)
+                        }) {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 4) {
                                     Text("History")
@@ -1543,22 +1670,75 @@ struct ContentView: View {
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
                             }
-                            Spacer()
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            isHoveringHistory = hovering
+                        }
+
+                        Spacer()
+
+                        // Custom folder buttons
+                        HStack(spacing: 6) {
+                            Button(action: selectCustomDirectory) {
+                                Image(systemName: "folder.badge.plus")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(textColor)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Use custom folder")
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+
+                            if customDirectoryPath != nil {
+                                Button(action: resetToDefaultDirectory) {
+                                    Image(systemName: "folder.badge.minus")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(textColor)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Reset to default folder")
+                                .onHover { hovering in
+                                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                }
+                            }
                         }
                     }
-                    .buttonStyle(.plain)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
-                    .onHover { hovering in
-                        isHoveringHistory = hovering
-                    }
-                    
+
                     Divider()
-                    
+
+                    // Search bar
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        TextField("Search", text: $searchText)
+                            .font(.system(size: 13))
+                            .textFieldStyle(.plain)
+                        if !searchText.isEmpty {
+                            Button(action: { searchText = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+
+                    Divider()
+
                     // Entries List
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(entries) { entry in
+                            ForEach(filteredEntries) { entry in
                                 Button(action: {
                                     if selectedEntryId != entry.id {
                                         historyDebug("ROW TAP \(debugEntrySummary(entry))")
@@ -1614,20 +1794,45 @@ struct ContentView: View {
                                                     .lineLimit(1)
                                                     .foregroundColor(.primary)
 
+                                                // Small pin indicator when pinned but not hovered
+                                                if isEntryPinned(entry) && hoveredEntryId != entry.id {
+                                                    Image(systemName: "pin.fill")
+                                                        .font(.system(size: 9))
+                                                        .foregroundColor(.secondary)
+                                                        .rotationEffect(.degrees(45))
+                                                }
+
                                                 Spacer()
-                                                
-                                                // Export/Trash icons that appear on hover
+
+                                                // Pin/Export/Trash icons that appear on hover
                                                 if hoveredEntryId == entry.id {
                                                     HStack(spacing: 8) {
+                                                        // Pin button
+                                                        Button(action: {
+                                                            togglePin(entry)
+                                                        }) {
+                                                            Image(systemName: isEntryPinned(entry) ? "pin.slash" : "pin")
+                                                                .font(.system(size: 11))
+                                                                .foregroundColor(hoveredPinId == entry.id ?
+                                                                    (currentColorScheme == .light ? .black : .white) :
+                                                                    (currentColorScheme == .light ? .gray : .gray.opacity(0.8)))
+                                                        }
+                                                        .buttonStyle(.plain)
+                                                        .help(isEntryPinned(entry) ? "Unpin entry" : "Pin entry")
+                                                        .onHover { hovering in
+                                                            hoveredPinId = hovering ? entry.id : nil
+                                                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                                        }
+
                                                         // Export PDF button
                                                         Button(action: {
                                                             exportEntryAsPDF(entry: entry)
                                                         }) {
                                                             Image(systemName: "arrow.down.circle")
                                                                 .font(.system(size: 11))
-                                                                .foregroundColor(hoveredExportId == entry.id ? 
-                                                                    (colorScheme == .light ? .black : .white) : 
-                                                                    (colorScheme == .light ? .gray : .gray.opacity(0.8)))
+                                                                .foregroundColor(hoveredExportId == entry.id ?
+                                                                    (currentColorScheme == .light ? .black : .white) :
+                                                                    (currentColorScheme == .light ? .gray : .gray.opacity(0.8)))
                                                         }
                                                         .buttonStyle(.plain)
                                                         .help("Export entry as PDF")
@@ -1641,7 +1846,7 @@ struct ContentView: View {
                                                                 NSCursor.pop()
                                                             }
                                                         }
-                                                        
+
                                                         // Trash icon
                                                         Button(action: {
                                                             deleteEntry(entry: entry)
@@ -1664,7 +1869,7 @@ struct ContentView: View {
                                                     }
                                                 }
                                             }
-                                            
+
                                             Text(entry.date)
                                                 .font(.system(size: 12))
                                                 .foregroundColor(.secondary)
@@ -1690,8 +1895,17 @@ struct ContentView: View {
                                 }
                                 .help("Click to select this entry")  // Add tooltip
                                 
-                                if entry.id != entries.last?.id {
-                                    Divider()
+                                if entry.id != filteredEntries.last?.id {
+                                    let currentIdx = filteredEntries.firstIndex(where: { $0.id == entry.id }) ?? 0
+                                    let nextIdx = currentIdx + 1
+                                    let isPinnedBoundary = isEntryPinned(entry) && nextIdx < filteredEntries.count && !isEntryPinned(filteredEntries[nextIdx])
+                                    if isPinnedBoundary {
+                                        Rectangle()
+                                            .fill(Color.gray.opacity(0.3))
+                                            .frame(height: 2)
+                                    } else {
+                                        Divider()
+                                    }
                                 }
                             }
                         }
@@ -1699,7 +1913,28 @@ struct ContentView: View {
                     .scrollIndicators(.never)
                 }
                 .frame(width: 200)
-                .background(Color(colorScheme == .light ? .white : NSColor.black))
+                .background(Color(currentColorScheme == .light ? .white : NSColor.black))
+            }
+        }
+        .overlay {
+            if showingTimeline {
+                TimelineView(
+                    entries: entries,
+                    colorScheme: currentColorScheme,
+                    onSelectEntry: { entry in
+                        if selectedEntryId != entry.id {
+                            if let currentId = selectedEntryId,
+                               let currentEntry = entries.first(where: { $0.id == currentId }),
+                               currentEntry.entryType == .text {
+                                saveEntry(entry: currentEntry)
+                            }
+                            selectedEntryId = entry.id
+                            loadEntry(entry: entry)
+                        }
+                    },
+                    onDismiss: { showingTimeline = false }
+                )
+                .zIndex(20)
             }
         }
         .overlay {
@@ -1721,10 +1956,19 @@ struct ContentView: View {
         }
         .frame(minWidth: 1100, minHeight: 600)
         .animation(.easeInOut(duration: 0.2), value: showingSidebar)
-        .preferredColorScheme(colorScheme)
+        .preferredColorScheme(currentColorScheme)
         .onAppear {
             showingSidebar = false  // Hide sidebar by default
             loadExistingEntries()
+            loadPinnedEntries()
+        }
+        .onChange(of: currentColorScheme) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            themeOverlayColor = oldValue == .light ? .white : .black
+            themeOverlayOpacity = 1
+            withAnimation(.easeInOut(duration: 0.35)) {
+                themeOverlayOpacity = 0
+            }
         }
         .onChange(of: showingVideoRecording) { _, isShowing in
             if !isShowing {
@@ -2268,4 +2512,5 @@ extension NSView {
 
 #Preview {
     ContentView()
+        .environmentObject(AppearanceManager())
 }
