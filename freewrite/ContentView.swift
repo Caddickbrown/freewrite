@@ -122,6 +122,8 @@ struct ContentView: View {
     @State private var isHoveringHistoryArrow = false
     @State private var isHoveringCopyTranscript = false
     @State private var colorScheme: ColorScheme = .light // Add state for color scheme
+    @State private var themeOverlayOpacity: Double = 0
+    @State private var themeOverlayColor: Color = .white
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
     @State private var didCopyPrompt: Bool = false // Add state for copy prompt feedback
     @State private var didCopyTranscript: Bool = false
@@ -875,6 +877,15 @@ struct ContentView: View {
                 Color(colorScheme == .light ? .white : .black)
                     .ignoresSafeArea()
 
+                // Theme transition overlay — fades out after instant theme switch
+                if themeOverlayOpacity > 0 {
+                    themeOverlayColor
+                        .ignoresSafeArea()
+                        .opacity(themeOverlayOpacity)
+                        .allowsHitTesting(false)
+                        .zIndex(999)
+                }
+
                 // Show video player if a video entry is selected
                 if let videoURL = currentVideoURL {
                     VideoPlayerView(
@@ -895,7 +906,7 @@ struct ContentView: View {
                     .lineSpacing(lineHeight)
                     .frame(maxWidth: 650)
                     .padding(.top, 40)
-                    .id("\(selectedFont)-\(fontSize)-\(colorScheme)")
+                    .id("\(selectedFont)-\(fontSize)")
                     .padding(.bottom, bottomNavOpacity > 0 ? navHeight : 0)
                     .colorScheme(colorScheme)
                     .onAppear {
@@ -1439,9 +1450,13 @@ struct ContentView: View {
                             
                             // Theme toggle button
                             Button(action: {
+                                themeOverlayColor = colorScheme == .light ? .white : .black
+                                themeOverlayOpacity = 1
                                 colorScheme = colorScheme == .light ? .dark : .light
-                                // Save preference
                                 UserDefaults.standard.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
+                                withAnimation(.easeInOut(duration: 0.35)) {
+                                    themeOverlayOpacity = 0
+                                }
                             }) {
                                 Image(systemName: colorScheme == .light ? "moon.fill" : "sun.max.fill")
                                     .foregroundColor(isHoveringThemeToggle ? textHoverColor : textColor)

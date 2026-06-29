@@ -16,6 +16,10 @@ class CameraManager: NSObject, ObservableObject {
     @Published var permissionGranted = false
     @Published var microphonePermissionGranted = false
     @Published var previewLayer: AVCaptureVideoPreviewLayer?
+    @Published var availableVideoDevices: [AVCaptureDevice] = []
+    @Published var selectedVideoDevice: AVCaptureDevice?
+    @Published var availableAudioDevices: [AVCaptureDevice] = []
+    @Published var selectedAudioDevice: AVCaptureDevice?
     private var liveCaptionText: String = ""
     private var committedCaptionText: String = ""
     @Published var speechPermissionGranted = false
@@ -141,6 +145,7 @@ class CameraManager: NSObject, ObservableObject {
 
     private func evaluateCapturePermissionsAndSetup() {
         if permissionGranted && microphonePermissionGranted && speechPermissionGranted {
+            refreshAvailableDevices()
             setupCamera()
             return
         }
@@ -158,6 +163,71 @@ class CameraManager: NSObject, ObservableObject {
         notifyCannotRecordIfNeeded()
     }
 
+    private func enumerateVideoDevices() -> [AVCaptureDevice] {
+        var types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .continuityCamera]
+        if #available(macOS 14.0, *) {
+            types.append(.external)
+        } else {
+            types.append(.externalUnknown)
+        }
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .video,
+            position: .unspecified
+        )
+        return session.devices
+    }
+
+    func refreshAvailableDevices() {
+        let videoDevices = enumerateVideoDevices()
+        let audioDevices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInMicrophone, .externalUnknown],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+        DispatchQueue.main.async {
+            self.availableVideoDevices = videoDevices
+            if self.selectedVideoDevice == nil ||
+               !videoDevices.contains(where: { $0.uniqueID == self.selectedVideoDevice?.uniqueID }) {
+                let externalType: AVCaptureDevice.DeviceType
+                if #available(macOS 14.0, *) {
+                    externalType = .external
+                } else {
+                    externalType = .externalUnknown
+                }
+                self.selectedVideoDevice = videoDevices.first(where: { $0.deviceType == externalType })
+                    ?? videoDevices.first(where: { $0.deviceType == .continuityCamera })
+                    ?? videoDevices.first
+            }
+
+            self.availableAudioDevices = audioDevices
+            if self.selectedAudioDevice == nil ||
+               !audioDevices.contains(where: { $0.uniqueID == self.selectedAudioDevice?.uniqueID }) {
+                self.selectedAudioDevice = audioDevices.first
+            }
+        }
+    }
+
+    func switchCamera(to device: AVCaptureDevice) {
+        selectedVideoDevice = device
+        if isSessionConfigured {
+            cleanup()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.setupCamera()
+            }
+        }
+    }
+
+    func switchMicrophone(to device: AVCaptureDevice) {
+        selectedAudioDevice = device
+        if isSessionConfigured {
+            cleanup()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.setupCamera()
+            }
+        }
+    }
+
     func setupCamera() {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
@@ -166,15 +236,17 @@ class CameraManager: NSObject, ObservableObject {
                 self.ensureSessionRunningAndPreviewAttached()
                 return
             }
-            
+
             if self.isSettingUpSession {
                 return
             }
             self.isSettingUpSession = true
             defer { self.isSettingUpSession = false }
 
-            guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
-                  let audioDevice = AVCaptureDevice.default(for: .audio) else {
+            let videoDevice = self.selectedVideoDevice ?? self.enumerateVideoDevices().first
+            let audioDevice = self.selectedAudioDevice ?? AVCaptureDevice.default(for: .audio)
+            guard let videoDevice = videoDevice,
+                  let audioDevice = audioDevice else {
                 print("Failed to get camera/audio device")
                 DispatchQueue.main.async {
                     self.notifyCannotRecordIfNeeded()
@@ -744,6 +816,14 @@ struct VideoRecordingView: View {
                     }
 
                     Spacer()
+                    if !cameraManager.isRecording {
+                        cameraPicker
+                        Text("•")
+                            .foregroundColor(.white.opacity(0.55))
+                        micPicker
+                        Text("•")
+                            .foregroundColor(.white.opacity(0.55))
+                    }
                     closeButton
                 }
                 .font(.system(size: 13))
@@ -789,6 +869,56 @@ struct VideoRecordingView: View {
             return isHoveringRecord ? .white : .white.opacity(0.92)
         }
         return isHoveringRecord ? .white : .white.opacity(0.92)
+    }
+
+    private var cameraPicker: some View {
+        Menu {
+            ForEach(cameraManager.availableVideoDevices, id: \.uniqueID) { device in
+                Button {
+                    cameraManager.switchCamera(to: device)
+                } label: {
+                    HStack {
+                        Text(device.localizedName)
+                        if device.uniqueID == cameraManager.selectedVideoDevice?.uniqueID {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(cameraManager.selectedVideoDevice?.localizedName ?? "Camera")
+                .foregroundColor(.white.opacity(0.9))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    private var micPicker: some View {
+        Menu {
+            ForEach(cameraManager.availableAudioDevices, id: \.uniqueID) { device in
+                Button {
+                    cameraManager.switchMicrophone(to: device)
+                } label: {
+                    HStack {
+                        Text(device.localizedName)
+                        if device.uniqueID == cameraManager.selectedAudioDevice?.uniqueID {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(cameraManager.selectedAudioDevice?.localizedName ?? "Microphone")
+                .foregroundColor(.white.opacity(0.9))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
     }
 
     private var closeButton: some View {
